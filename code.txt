@@ -1,0 +1,2833 @@
+function M = chooseNumCentres(w, new_budget)
+
+% Adaptive number of KDE centres
+%
+%  Inputs:
+%    w          : N×1 positive weights, already normalised (sum=1)
+%    new_budget : batch size we intend to propose
+%
+%  Output:
+%    M : number of KDE centres
+
+
+% Coverage: cumulative weight threshold
+covT  = 0.9;
+% Target q/M ratio
+alpha = 2;
+
+wSorted = sort(w,'descend');
+kCov = find(cumsum(wSorted) >= covT, 1,'first');
+
+if isempty(kCov), kCov = numel(w); end  % extremely flat weights
+
+% combine both criteria
+M = min( ceil( new_budget / alpha ), kCov );
+end
+function split = create_subspaces(ndims,manual_splits)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+if (0<ndims) && (ndims<=3)
+
+    split = {1:ndims};
+
+elseif ndims > 3 && nargin == 1  % No manual splits
+
+    [nsub3,nsub2] = number_subsp(ndims);
+
+    split = cell(nsub3+nsub2,1);
+
+    for i=1:nsub3
+        split{i} = [3*i-2 3*i-1 3*i];
+    end
+    
+    if nsub2==1
+        split{nsub3+nsub2} = [3*nsub3+1 3*nsub3+2];
+    elseif nsub2==2
+        split{nsub3+nsub2-1} = [3*nsub3+1 3*nsub3+2];
+        split{nsub3+nsub2} = [3*nsub3+3 3*nsub3+4];
+    end
+
+elseif ndims > 3 && nargin > 1  % Manual splits
+
+    % We check that the manual splits do not share
+    % dimensions with each other
+    elems = [];
+    for i=1:length(manual_splits)
+        elems = cat(2,elems,manual_splits{i});
+    end
+    elems_u = unique(elems);
+    if length(elems) ~= length(elems_u)
+        error('Subspaces cannot share dimensions. Check manual dimensions')
+    end
+
+    
+    dims_taken = [];
+    for i=1:length(manual_splits)
+        dims_taken = cat(2,dims_taken,manual_splits{i});
+    end
+    dims_taken = sort(dims_taken);
+
+    ndims_left = ndims - length(dims_taken);
+
+    [nsub3,nsub2] = number_subsp(ndims_left);
+
+    autom_splits = cell(nsub3+nsub2,1);
+
+    candidates = setdiff(1:ndims,dims_taken);
+
+    for i=1:nsub3
+        autom_splits{i} = [candidates(3*i-2) ...
+                           candidates(3*i-1) ...
+                           candidates(3*i)];
+    end
+    if nsub2==1
+        autom_splits{nsub3+nsub2} = [candidates(end-1) candidates(end)];
+    elseif nsub2==2
+        autom_splits{nsub3+nsub2-1} = [candidates(end-3) candidates(end-2)];
+        autom_splits{nsub3+nsub2} = [candidates(end-1) candidates(end)];
+    end
+
+    split = [manual_splits'; autom_splits];
+
+else
+    error('The function cannot have a negative number of dimensions')
+end
+
+end
+
+function [samples_pos_tri, weighted_means_pos] = ...
+         discretiseCoords(samples_tri, weighted_means, discret_spl, dim_spl)
+
+%   Snap each row of samples_tri to an integer grid defined by dim_spl
+%   and average weighted_means when multiple rows land on the same bin.
+%
+% Inputs:
+%   samples_tri      N×D  continuous coordinates
+%   weighted_means   N×1  values attached to every row of samples_tri
+%   discret_spl      1×D  cell; discret_spl{d}(1) = min_d, end = max_d
+%   dim_spl          1×D  number of discrete indices per dimension
+%
+% Outputs:
+%   samples_pos_tri      M×D  integer indices (1...dim_spl(d))
+%   weighted_means_pos   M×1  averaged values for each unique row
+
+
+[N, D] = size(samples_tri);
+assert(numel(discret_spl) == D, 'discret_spl must have D cells');
+assert(numel(dim_spl) == D, 'dim_spl must have length D');
+assert(size(weighted_means,1) == N, 'weighted_means must match rows');
+
+
+%% 1. Map every coordinate to its integer bin index
+idxMat = zeros(N, D);
+
+for d = 1:D
+    lo = discret_spl{d}(1);    % lower bound
+    hi = discret_spl{d}(end);  % upper bound
+    M = dim_spl(d);            % number of bins
+    step = (hi-lo) / (M-1);    % uniform spacing
+
+    % Nearest index in 1...M
+    idx = round((samples_tri(:,d) - lo) / step) + 1;
+    idx = min(max(idx,1), M);  % clamp
+    idxMat(:,d) = idx;
+end
+
+
+%% 2. Collapse duplicates & average values
+[samples_pos_tri, ~, ic] = unique(idxMat, 'rows');   % ic: group id (N×1)
+weighted_means_pos = accumarray(ic, weighted_means, [], @mean);
+
+end
+function elapsed = efficient_sampler(ex,func_name,dims,total_budget)
+
+% continuous_complex_2D, epidemic_3D, rosenbrock_3D
+
+% func_name = "well";
+% dims = 24;
+% total_budget = 50000;
+
+st = dbstack;
+f_name = st.name;
+
+tic
+
+% Fix the seed for reproducibility
+rng(42+ex, 'twister');  % 51
+
+%% 1. INPUT PARAMETERS
+
+new_budget = 64;  % budget for next iterations - 4
+% n_runs = 12;  % 200
+
+fixed_strategy = 0;  % 0 (no), 1, 2, 3
+
+% input parameter: err_min_value | err_tensor_estimation
+err_func_name = 'err_samples_prediction_stdev';
+
+opt_function = str2func(func_name);
+name = strcat(func_name,"_",int2str(dims));
+
+
+%% 2. INTERNAL PARAMETERS
+
+n_strategies = 3;
+if fixed_strategy ~= 0
+    n_strategies = 1;
+end
+
+analysis = logical(1-0);  % USE false  1-1
+
+epsilon = 0.1;  % for epsilon-greedy strategy
+
+
+%% 3. INITIALIZATION
+
+error_function = str2func(err_func_name);
+
+% paramspace not used
+[~,discret,steps,dim,n_dims,splits] = initialize_function(name);
+
+initial_budget = min(2000*numel(splits), floor(0.1*total_budget));  % 20*|50*
+
+% Structural information about subspaces
+% n_dims_left_run, dims_before_run & dims_after_run not used
+[ndims_run,dims_run,steps_run,discrets_run,~,~,~,dims_left_run] = ...
+    initialize_splits(splits,dim,steps,discret,n_dims);
+clear steps
+
+% We will execute each strategy at least once.
+% After that we concatenate the new results
+err_means = cellfun(@(x) zeros(n_strategies,n_strategies), splits, ...
+    'UniformOutput', false);
+
+errs_sts = cell(n_strategies,length(splits));
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Checkings
+samples_pos_sts = cell(n_strategies,length(splits));
+strategy1 = cell(numel(splits),1);
+strategy1_vals = cell(numel(splits),1);
+strategy2 = cell(numel(splits),1);
+strategy2_vals = cell(numel(splits),1);
+strategy3 = cell(numel(splits),1);
+strategy3_vals = cell(numel(splits),1);
+samples_tri_wm = cell(numel(splits),1);
+samples_pos_err_wm = cell(numel(splits),1);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% RUN variables are used to share information of the different subspaces
+% across the different runs
+samples_pos_tri_run = cell(size(splits));
+samples_tri_run = cell(size(splits));
+% triangs_run = cell(size(splits));
+
+% Variable that stores the samples proposed by each strategy in each subspace
+samples_tri_sts = cell(n_strategies,length(splits));
+% Variable that stores the samples proposed by each strategy
+samples_comp_sts = cell(n_strategies,length(splits));
+
+% To share information
+% samples_pos_err_subesp_prev = cell(size(splits));
+store = cell(1, numel(splits));
+
+for s = 1:numel(splits)
+    d      = numel(splits{s});  % 2 or 3 for this subspace
+    empty  = zeros(0, d+1);     % 0 rows, (d coords + val) cols
+    
+    % One cell per strategy, every cell starts with an empty matrix
+    store{s}.samples = repmat({empty}, 1, n_strategies);
+
+    % (optional) Keep meta-data
+    % store{s}.dims    = d;           % dimensionality
+    % store{s}.idx     = splits{s};   % columns of the global point
+end
+
+% To add extra close samples
+samples_comp_extra = [];
+
+% For evaluating fit
+% samples_comp_eval = [];
+
+% For analysis and representation purposes (plot, etc.)
+if analysis
+    samples_timeline = cell(numel(splits),1);
+    for i = 1:numel(splits)
+        samples_timeline{i} = zeros(n_strategies,1);
+    end
+
+    % times = zeros(1,n_runs);
+
+    % Save other variables if necessary
+end
+
+
+%% 4. INITIAL SAMPLES
+
+samples_comp_orig = generate_initial_samples_NEW(splits, dim, ...
+    initial_budget, discret, opt_function);
+
+% % To avoid duplicates when proposing samples
+samples_pos_comp_TRACK = [];
+
+% Output variable
+samples_OUTPUT = samples_comp_orig;
+
+% Build a fast hash of already-used points
+row2key = @(p) sprintf('%.12g_', p);
+taken   = containers.Map('KeyType','char','ValueType','logical');
+for k = 1:size(samples_OUTPUT,1)
+    taken(row2key(samples_OUTPUT(k,:))) = true;
+end
+
+if size(samples_OUTPUT,1) < total_budget
+    
+    % Create the model with the initial samples
+    X = samples_comp_orig(:,1:end-1);
+    y = samples_comp_orig(:,end);
+    
+    Mdl = fitrensemble(X,y,'NumLearningCycles',50);
+    models_sts = repmat({Mdl}, 1, n_strategies);  % save the models
+    clear X y Mdl
+    
+    
+    %% 5. FIRST RUNS (EACH STRATEGY ONCE)
+    
+    samples_pos_tri_copy = samples_pos_tri_run;
+    samples_tri_copy = samples_tri_run;
+    
+    samples_pos_err_copy = cell(size(splits));
+    
+    st = fixed_strategy;
+    
+    for s=1:n_strategies
+        
+        % % Time performance
+        % if analysis
+        %     tic
+        % end
+    
+        if fixed_strategy == 0
+            st = s;
+        end
+        
+        % To share information
+        samples_pos_err_subesp = cell(size(splits));
+    
+        for i=1:length(splits)
+    
+            % Structural information about the subspace
+            % (does not change over time)
+            % steps_spl not used
+            [spl,ndim_spl,dim_spl,~,discret_spl,dims_left] = ...
+                get_split_information(splits,ndims_run,dims_run, ...
+                steps_run,discrets_run,dims_left_run,i);
+    
+            % Information about the samples we have so far
+            % samples_pos_tri = samples_pos_tri_run{i};
+            % samples_tri = samples_tri_run{i};
+            % T = triangs_run{i};
+            
+            % Execute Strategy
+            [samples_pos_tri_copy, ...
+             samples_OUTPUT, ...
+             taken, ...
+             samples_pos_comp_TRACK, ...
+             samples_tri_copy, ...
+             samples_tri_sts, samples_comp_sts, ...
+             ~, ...
+             samples_pos_err_subesp, err, ...
+             samples_pos_sts, ...
+             strategy1, strategy1_vals, ...
+             strategy2, strategy2_vals, ...
+             strategy3, strategy3_vals, ...
+             samples_tri_wm, samples_pos_err_wm, ...
+             store] = execute_strategy(st, ...
+                ndim_spl, dim_spl, discret_spl, ...
+                new_budget, ...
+                samples_pos_comp_TRACK, ...
+                samples_pos_tri_copy, ...
+                i, ...
+                spl, ...
+                dims_left, dim, ...
+                discret, ...
+                opt_function, ...
+                samples_OUTPUT, ...
+                taken, ...
+                samples_tri_copy, ...
+                samples_tri_sts, samples_comp_sts, ...
+                s, ...
+                splits, ...
+                models_sts, ...
+                error_function, ...
+                samples_pos_err_subesp, ...
+                samples_pos_sts, ...
+                strategy1, strategy1_vals, ...
+                strategy2, strategy2_vals, ...
+                strategy3, strategy3_vals, ...
+                samples_tri_wm, samples_pos_err_wm, ...
+                store);
+    
+            % Save the information for the end of the initial strategy loop
+            samples_pos_err_copy{i} = [samples_pos_err_copy{i}; ...
+                samples_pos_err_subesp{i}];
+    
+            % We store the error in the strategy and subspace compartment
+            % in order to calculate the mean for MAB
+            errs_sts{s,i} = err;
+    
+            % We store the error of the first rounds
+            err_means{i}(1:n_strategies,s) = err;
+    
+        end  % [SPLIT/SUBSPACE LOOP]
+        
+        % % Time performance
+        % if analysis
+        %     tc = toc;
+        %     times(s) = tc;
+        %     % fprintf('%i - %f\n', s, tc);
+        % end
+    
+    end  % [STRATEGY LOOP]
+    
+    % Update the strategy model with new samples
+    models_sts = update_models(n_strategies,models_sts, ...
+        samples_comp_orig,samples_comp_extra,samples_comp_sts);
+    
+    % We keep the updated samples
+    samples_pos_tri_run = samples_pos_tri_copy;
+    samples_tri_run = samples_tri_copy;
+    
+    % samples_pos_err_subesp = samples_pos_err_copy;  % In reality, they are no longer positions (RENAME)
+    
+    clear samples_pos_tri_copy samples_tri_copy samples_pos_err_copy
+    
+    
+    % st_ex = zeros(length(splits), n_runs);
+    % sam_ex = zeros(length(splits), n_runs);
+    % time_ex = zeros(length(splits), n_runs);
+    % cls = zeros(1, n_runs);
+    % cmb = zeros(1, n_runs);
+    % sam_mdl = zeros(n_strategies, n_runs);
+    % time_mdl = zeros(n_strategies, n_runs);
+    
+
+    %% 6. NEXT RUNS
+    
+    r = n_strategies+1;
+    % fixed_strategy = 3;
+    
+    % for r=n_strategies+1:6
+    while size(samples_OUTPUT,1) < total_budget
+    
+        % fprintf('Run %i\n', r)
+        
+        % % Time performance
+        % if analysis
+        %     tic
+        % end
+    
+        % Duplicate errors
+        for j=1:length(splits)
+            err_means{j} = [err_means{j}; err_means{j}(end,:)];
+        end
+    
+        % To share information
+        % samples_pos_err_subesp_prev = samples_pos_err_subesp;
+        samples_pos_err_subesp = cell(size(splits));
+    
+        % For evaluating fit
+        % samples_comp_eval = [];
+    
+        for i=1:length(splits)
+    
+            % Structural information about the subspace
+            % (does not change over time)
+            % steps_spl not used
+            [spl,ndim_spl,dim_spl,~,discret_spl,dims_left] = ...
+                get_split_information(splits,ndims_run,dims_run, ...
+                steps_run,discrets_run,dims_left_run,i);
+
+    
+            % STRATEGY SELECTION
+            if fixed_strategy == 0
+                argmax = epsilon_greedy(epsilon,err_means{i}(r,:), ...
+                    n_strategies);
+                
+                % If the strategy is not fixed, the index in which
+                % to store the results will be the one indicated by the
+                % selected strategy (argmax)
+                s = argmax;
+            else
+                argmax = fixed_strategy;
+                % If the strategy is fixed, the index in which
+                % to store the results will be 1 because there is only
+                % one strategy
+                s = 1;
+            end
+    
+            % fprintf('Split %i. Strategy %i\n', i, argmax)
+            
+            % tic
+            % Execute Strategy
+            [samples_pos_tri_run, ...
+             samples_OUTPUT, ...
+             taken, ...
+             samples_pos_comp_TRACK, ...
+             samples_tri_run, ...
+             samples_tri_sts, samples_comp_sts, ...
+             ~, ...
+             samples_pos_err_subesp, err, ...
+             samples_pos_sts, ...
+             strategy1, strategy1_vals, ...
+             strategy2, strategy2_vals, ...
+             strategy3, strategy3_vals, ...
+             samples_tri_wm, samples_pos_err_wm, ...
+             store] = execute_strategy(argmax, ...
+                ndim_spl, dim_spl, discret_spl, ...
+                new_budget, ...
+                samples_pos_comp_TRACK, ...
+                samples_pos_tri_run, ...
+                i, ...
+                spl, ...
+                dims_left, dim, ...
+                discret, ...
+                opt_function, ...
+                samples_OUTPUT, ...
+                taken, ...
+                samples_tri_run, ...
+                samples_tri_sts, samples_comp_sts, ...
+                s, ...
+                splits, ...
+                models_sts, ...
+                error_function, ...
+                samples_pos_err_subesp, ...
+                samples_pos_sts, ...
+                strategy1, strategy1_vals, ...
+                strategy2, strategy2_vals, ...
+                strategy3, strategy3_vals, ...
+                samples_tri_wm, samples_pos_err_wm, ...
+                store);
+            
+            % tc_ex = toc;
+            % fprintf('%i samples. Execution time: %fs\n', ...
+            %     size(samples_tri,1), tc_ex)
+            % st_ex(i,r) = argmax;
+            % sam_ex(i,r) = size(samples_tri,1);
+            % time_ex(i,r) = tc_ex;
+            
+            % We store the error in the strategy and subspace compartment
+            % in order to calculate the mean for MAB
+            errs_sts{s,i} = cat(1,errs_sts{s,i},err);
+    
+            % The error is updated with the information that is obtained.
+            % That is, the new error is not concatenated, but the average
+            % of the errors so far is concatenated
+            err_means{i}(r,s) = mean(errs_sts{s,i});
+    
+            % Information for analysis
+            if analysis
+                % strategy 'argmax' chosen
+                samples_timeline{i} = [samples_timeline{i}; argmax];
+            end
+    
+        end  % [SPLIT/SUBSPACE LOOP]
+        
+        % Update the strategy model with new samples
+        models_sts = update_models(n_strategies,models_sts, ...
+            samples_comp_orig,samples_comp_extra,samples_comp_sts);
+    
+        r = r+1;
+        
+        % % Time performance
+        % if analysis
+        %     tc = toc;
+        %     times(r) = tc;
+        %     fprintf('%i - %f\n', r, tc);
+        % end
+        
+        fprintf('%i samples generated so far\n', size(samples_OUTPUT,1))
+        % disp(' ')
+    
+    end  % [RUN LOOP]
+
+end  % [IF initial_samples LOOP]
+
+elapsed = toc;
+
+% strategies = [samples_timeline{1}, samples_timeline{1}];
+% fn = sprintf("experiments/ex%d_strategies.xlsx",ex);
+% writematrix(strategies, fn);
+
+filename = sprintf("experiments/%d/ex%d_%s_%s_%d_%d.mat",ex,ex, ...
+    f_name,func_name,dims,total_budget);
+% _150_50_101_2
+% _100_10_101_5_02_max_max
+dataset = samples_OUTPUT;
+save(filename, "dataset")
+
+end
+function argmax = epsilon_greedy(epsilon,err_means_v,n_strategies)
+
+% EPSILON-GREEDY
+% We use epsilon to encourage exploration.
+% If we do not want so much exploration try 'epsilon-decreasing',
+% 'Initial Optimism epsilon-greedy' or 'VDBE'
+
+rand_val = rand;
+
+if rand_val < epsilon
+    % Exploration: choose a strategy at random
+    argmax = randi(n_strategies);
+else
+    % Exploitation: choose the best known strategy
+    % We want to focus on the strategy that yields the maximum errors
+    % (put more samples there)
+    [~, argmax] = max(err_means_v);
+end
+
+end
+function errs = err_samples_prediction_stdev(gprMdl,samples_comp)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+ypred = predict(gprMdl,samples_comp(:,1:end-1));
+% [ypred,ysd,~] = predict(gprMdl,samples_comp(:,1:end-1));
+
+diffs = abs(samples_comp(:,end) - ypred);  % ./samples_comp(:,end)
+
+errs = [diffs, zeros(size(diffs))];  % ysd
+
+end
+
+function grad_v = estimate_gradient(varargin)
+       % [areas_vols,grad,grad_v,grad_v_norm]
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+% Replacing `estimate_grad_fun` and `estimate_grad_crit`
+
+% nargin = 2;  % 3
+
+T = varargin{1};
+samples = varargin{2};
+if nargin == 3
+    criticality = varargin{3};
+end
+
+ndims = size(samples,2)-1;
+n_triang = size(T,1);  % number of triangles
+
+% x = samples(:,1);
+% y = samples(:,2);
+% z = samples(:,3);
+% 
+% TR = triangulation(T.ConnectivityList,x,y,z);
+% F = featureEdges(TR,pi/6)';
+% figure
+% plot3(x(F),y(F),z(F),'k');
+
+% Precompute value sources based on nargin
+if nargin == 2
+    % Gradient of the function values
+    get_value = @(vertex_idx) samples(vertex_idx, ndims+1);  % get from samples
+elseif nargin == 3
+    % Gradient of the criticalities
+    get_value = @(vertex_idx) criticality(vertex_idx);  % get from criticality
+end
+
+if ndims == 2
+
+    % samples = [x y value]
+    vertices = T.ConnectivityList;
+
+    % Extract coordinates of vertices (i, j, k) for all triangles
+    % It is possible to change samples to T.Points
+    i_coords = samples(vertices(:,1), 1:ndims);  % [n_triang x ndims]
+    j_coords = samples(vertices(:,2), 1:ndims);  % [n_triang x ndims]
+    k_coords = samples(vertices(:,3), 1:ndims);  % [n_triang x ndims]
+
+    % Extract function/criticality values for all vertices
+    i_f = get_value(vertices(:,1));  % [n_triang x 1]
+    j_f = get_value(vertices(:,2));  % [n_triang x 1]
+    k_f = get_value(vertices(:,3));  % [n_triang x 1]
+
+    % Compute edge vectors (i.e., triangle sides)
+    ik = i_coords - k_coords;  % [n_triang x ndims]
+    ji = j_coords - i_coords;  % [n_triang x ndims]
+
+    % Compute triangle areas
+    areas = 0.5 * ...
+        abs((j_coords(:,1) - i_coords(:,1)) .* (k_coords(:,2) - i_coords(:,2)) - ...
+            (k_coords(:,1) - i_coords(:,1)) .* (j_coords(:,2) - i_coords(:,2)));  % [n_triang x 1]
+
+    % Alternative way
+    % area_t = 0.5 * abs(i(1)*j(2) + j(1)*k(2) + k(1)*i(2) - j(1)*i(2) - k(1)*j(2) - i(1)*k(2));
+    
+    % Rotation matrix for 90 degrees
+    rotation_matrix = [0 -1; 1 0];  % 90-degree rotation in 2D
+
+    % Rotate vectors using the rotation matrix
+    ikr = ik * rotation_matrix';  % Rotate ik (results in [n_triang x 2])
+    jir = ji * rotation_matrix';  % Rotate ji (results in [n_triang x 2])
+
+    % ang = (pi/180) * 90;  % 90 degrees
+    % % NORM IS THE SAME AFTER ROTATION
+    % % Rotate vector 1
+    % [th,r] = cart2pol(ik(1),ik(2));
+    % [xr1,yr1] = pol2cart(th+ang, r);
+    % % Rotate vector 2
+    % [th,r] = cart2pol(ji(1),ji(2));
+    % [xr2,yr2] = pol2cart(th+ang, r);
+    % 
+    % ikr = [xr1 yr1];
+    % jir = [xr2 yr2];
+
+    grad = (j_f - i_f) .* (ikr ./ (2 * areas)) + ...
+           (k_f - i_f) .* (jir ./ (2 * areas));
+
+    % disp(grad)
+
+elseif ndims == 3
+    
+    % volums = zeros(n_triang,1);
+    grad = zeros(n_triang,ndims);
+
+    % samples = [x y z value]
+    vertices = T.ConnectivityList;
+
+    % Extract coordinates of vertices (i, j, k) for all triangles
+    % It is possible to change samples to T.Points
+    i_coords = samples(vertices(:,1), 1:ndims);  % [n_triang x ndims]
+    j_coords = samples(vertices(:,2), 1:ndims);  % [n_triang x ndims]
+    k_coords = samples(vertices(:,3), 1:ndims);  % [n_triang x ndims]
+    h_coords = samples(vertices(:,4), 1:ndims);  % [n_triang x ndims]
+
+    % Extract function/criticality values for all vertices
+    i_f = get_value(vertices(:,1));  % [n_triang x 1]
+    j_f = get_value(vertices(:,2));  % [n_triang x 1]
+    k_f = get_value(vertices(:,3));  % [n_triang x 1]
+    h_f = get_value(vertices(:,4));  % [n_triang x 1]
+    
+    % Compute edge vectors (i.e., triangle sides)
+    ji = j_coords - i_coords;  % [n_triang x ndims]
+    ki = k_coords - i_coords;  % [n_triang x ndims]
+    hi = h_coords - i_coords;  % [n_triang x ndims]
+
+    ik = i_coords - k_coords;
+    hk = h_coords - k_coords;
+    ih = i_coords - h_coords;
+    jh = j_coords - h_coords;
+
+    ji_f = j_f - i_f;
+    ki_f = k_f - i_f;
+    hi_f = h_f - i_f;
+
+    % Number of triangles
+    parfor t = 1:n_triang
+        
+        volum_t = (1/6) * abs(det([ji(t,:); ki(t,:); hi(t,:)]));
+
+        if volum_t ~= 0
+            % volums(t) = volum_t;
+            
+            grad(t,:) = (ji_f(t)) * (cross(ik(t,:),hk(t,:)) / (2*volum_t)) + ...
+                        (ki_f(t)) * (cross(ih(t,:),jh(t,:)) / (2*volum_t)) + ...
+                        (hi_f(t)) * (cross(ki(t,:),ji(t,:)) / (2*volum_t));
+
+            % If the volume is 0, we leave the gradient in the tetrahedron
+            % with value 0
+            % because the solid angle will be 0 (or practically 0)
+            % anyway and we can ignore its value
+
+            % When the 4 points are on the same plane,
+            % the volume could be 0 (det=0)
+
+            % % Example:
+            % P1 = [1.8000, 0.9500, 1.1000];
+            % P2 = [1.6500, 0.9500, 0.9000];
+            % P3 = [1.8500, 0.9000, 0.7500];
+            % P4 = [2.0000, 0.9000, 0.9500];
+            % 
+            % X = [1.8000, 1.6500, 1.8500, 2.0000];
+            % Y = [0.9500, 0.9500, 0.9000, 0.9000];
+            % Z = [1.1000, 0.9000, 0.7500, 0.9500];
+            % 
+            % % Points
+            % scatter3(X,Y,Z,'.','LineWidth',100)
+            % xlim([1.5, 2]);
+            % ylim([0.8, 1]);
+            % zlim([0.6, 1.2]);
+            % 
+            % % Vectors
+            % PA = [P1;P2];
+            % PB = [P1;P3];
+            % PC = [P1;P4];
+            % 
+            % plot3(PA(:,1),PA(:,2),PA(:,3),'r','LineWidth',2)
+            % hold on
+            % plot3(PB(:,1),PB(:,2),PB(:,3),'r','LineWidth',2)
+            % hold on
+            % plot3(PC(:,1),PC(:,2),PC(:,3),'r','LineWidth',2)
+            % grid on
+            % xlim([1.5, 2]);
+            % ylim([0.8, 1]);
+            % zlim([0.6, 1.2]);
+        end
+        
+    end  % [parfor]
+    
+    % disp(grad)
+end
+
+% % TO RETURN
+% if ndims == 2
+%     areas_vols = areas;
+% elseif ndims == 3
+%     areas_vols = volums;
+% end
+
+% PLOT
+% if ndims == 2
+%     for p = 1:size(T.Points,1)
+%         figure
+%         triplot(T)
+%         hold on  
+%         triplot(T(V{p,:},:),samples(:,1),samples(:,2),'Color','r')
+%         hold on
+%         plot(T.Points(p,1),T.Points(p,2),'k.','MarkerSize',12)
+%         hold off
+%     end
+% elseif ndims == 3
+%     for p = 1:size(T.Points,1)
+%         figure
+%         tetramesh(T,'FaceAlpha',0.3)
+%         hold on  
+%         tetramesh(T(V{p,:},:),samples(:,1),samples(:,2),samples(:,3),'Color','r')
+%         hold on
+%         plot(T.Points(p,1),T.Points(p,2),T.Points(p,3),'k.','MarkerSize',12)
+%         hold off
+%     end
+% end
+
+
+%% AVERAGE GRADIENT ON STAR (AGS)
+
+% Compute star (neighbourhood)
+V = vertexAttachments(T);
+% V{p,:}
+
+% Extract points once for reuse
+points = T.Points;
+
+grad_v = zeros(size(points,1),ndims);
+% grad_v_norm = zeros(size(points,1),1);
+
+% % Create a reduced version of T.ConnectivityList for each vertex
+% vertex_to_triangles = cell(size(points,1), 1);
+% for p = 1:size(points,1)
+%     vertex_to_triangles{p} = T.ConnectivityList(V{p,:},:);  % Extract relevant triangles
+% end
+
+if ndims == 2
+
+    % Number of vertex
+    for p = 1:size(points,1)
+        % Get triangle indices connected to vertex `p`
+        triangle_ids = V{p,:};
+        % Triangles
+        triangl = T(triangle_ids,:);
+        
+        % Initialize storage for angles and gradient sums
+        num_triangles = size(triangl,1);
+        angles = zeros(num_triangles,1);
+        sum_grad = zeros(1,ndims);
+    
+        % Loop over connected triangles to compute neighbours angles
+        for i = 1:num_triangles
+            tri_id = triangle_ids(i);
+            point_ids = triangl(i,:);
+    
+            point_ids(point_ids==p) = [];
+            P1 = points(p,:);
+            P2 = points(point_ids(1),:);
+            P3 = points(point_ids(2),:);
+            
+            % In radians
+            angle = atan2(2*areas(tri_id), dot(P2-P1,P3-P1));
+            % Convert to degrees
+            % angle = angle*180/pi;
+            
+            % Accumulate weighted gradient
+            angles(i) = angle;
+            sum_grad = sum_grad + angle*grad(tri_id,:);
+        end
+        
+        g = sum_grad/sum(angles);  % The sum of the angles cannot be 0
+        % disp(g)
+    
+        grad_v(p,:) = g;
+        % Euclidean norm
+        % grad_v_norm(p) = norm(g);
+    end
+
+elseif ndims == 3
+
+    % Number of vertex
+    for p = 1:size(points,1)
+        % Get triangle indices connected to vertex `p`
+        triangle_ids = V{p,:};
+        % Triangles
+        triangl = T(triangle_ids,:);
+        
+        % Initialize storage for angles and gradient sums
+        num_triangles = size(triangl,1);
+        angles = zeros(num_triangles,1);
+        sum_grad = zeros(1,ndims);
+    
+        % Loop over connected triangles to compute neighbours angles
+        for i = 1:num_triangles
+            tri_id = triangle_ids(i);
+            point_ids = triangl(i,:);
+    
+            point_ids(point_ids==p) = [];
+            P1 = points(p,:);
+            P2 = points(point_ids(1),:);
+            P3 = points(point_ids(2),:);
+            P4 = points(point_ids(3),:);
+        
+            % In steradians
+            angle = abs(Solid_Angle_Triangle(P1,P2,P3,P4));  % without sign
+            
+            % angle = solidangle(P2-P1,P3-P1,P4-P1);
+
+            % When the 3 edges forming the angle are on the same plane,
+            % the function 'solidangle' could return complex values
+            
+            % % Example:
+            % P1 = [1.2000, 1.7000, 1.4000];
+            % P2 = [1.5000, 1.8000, 1.1000];
+            % P3 = [1.3000, 1.6000, 1.4000];
+            % P4 = [1.4000, 1.9000, 1.1000];
+            % 
+            % X = [1.2000, 1.5000, 1.3000, 1.4000];
+            % Y = [1.7000, 1.8000, 1.6000, 1.9000];
+            % Z = [1.4000, 1.1000, 1.4000, 1.1000];
+            % 
+            % % Points
+            % scatter3(X,Y,Z,'.','LineWidth',100)
+            % xlim([1, 1.6]);
+            % ylim([1.4, 2]);
+            % zlim([1, 1.6]);
+            % 
+            % % Vectors
+            % PA = [P1;P2];
+            % PB = [P1;P3];
+            % PC = [P1;P4];
+            % 
+            % plot3(PA(:,1),PA(:,2),PA(:,3),'r','LineWidth',2)
+            % hold on
+            % plot3(PB(:,1),PB(:,2),PB(:,3),'r','LineWidth',2)
+            % hold on
+            % plot3(PC(:,1),PC(:,2),PC(:,3),'r','LineWidth',2)
+            % grid on
+            % xlim([1, 1.6]);
+            % ylim([1.4, 2]);
+            % zlim([1, 1.6]);
+            
+            % Accumulate weighted gradient
+            angles(i) = angle;
+
+            sum_grad = sum_grad + angle*grad(tri_id,:);
+        end
+        
+        % To check (ndims == 3):
+        % - The sum of the angles of a vertex point must sum to (4*pi)/8 = 1.5708
+        % - The sum of an angle on one side of the cube must sum to (4*pi)/2 = 6.2832
+        % - The sum of an interior point must sum to 4*pi = 12.5664
+    
+        % if ndims == 3
+        %     if p<=8
+        %         fprintf('corner: %f\n',sum(angles));
+        %     elseif sum(angles)<12
+        %         fprintf('point [%f, %f, %f]: %f\n',points(p,:),sum(angles));
+        %     else
+        %         fprintf('%f\n',sum(angles));
+        %     end
+        % end
+        % The same could be done for 2 dimension
+
+
+        % Note that a center point has 4π sr.
+        % Therefore, a corner of the cube will have π/2 sr.
+        
+        sa = sum(angles);
+        g = sum_grad/sa;  % The sum of the angles cannot be 0
+        % disp(g)
+        
+        % Condition to de-emphasize parameter space edges.
+        % If we are at an edge, we reduce the gradient value by 2  %%%%%%%% CHECK
+        if sa < 4*pi
+            grad_v(p,:) = g/2;
+        else
+            grad_v(p,:) = g;
+        end
+        % Euclidean norm
+        % grad_v_norm(p) = norm(g);
+    
+    end
+
+end
+
+% CHECK:
+% faceNormal
+% nearestNeighbor
+% vertexNormal
+
+end
+
+function [samples_pos_tri_run, ...
+    samples_OUTPUT, ...
+    taken, ...
+    samples_pos_comp_TRACK, ...
+    samples_tri_run, ...
+    samples_tri_sts, samples_comp_sts, ...
+    samples_comp_eval, ...
+    samples_pos_err_subesp, err, ...
+    samples_pos_sts, ...
+    strategy1, strategy1_vals, ...
+    strategy2, strategy2_vals, ...
+    strategy3, strategy3_vals, ...
+    samples_tri_wm, samples_pos_err_wm, ...
+    store] = execute_strategy(st, ...
+                    ndim_spl, dim_spl, discret_spl, ...
+                    new_budget, ...
+                    samples_pos_comp_TRACK, ...
+                    samples_pos_tri_run, ...
+                    i, ...
+                    spl, ...
+                    dims_left, dim, ...
+                    discret, ...
+                    opt_function, ...
+                    samples_OUTPUT, ...
+                    taken, ...
+                    samples_tri_run, ...
+                    samples_tri_sts, samples_comp_sts, ...
+                    s, ...
+                    splits, ...
+                    models_sts, ...
+                    error_function, ...
+                    samples_pos_err_subesp, ...
+                    samples_pos_sts, ...
+                    strategy1, strategy1_vals, ...
+                    strategy2, strategy2_vals, ...
+                    strategy3, strategy3_vals, ...
+                    samples_tri_wm, samples_pos_err_wm, ...
+                    store)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+samples_tri = samples_OUTPUT(:,spl);
+weighted_means = samples_OUTPUT(:,end);
+
+% 1) Unique rows. ic  tells to which row each original row belongs
+[samples_tri, ~, ic] = unique(samples_tri, 'rows');
+% 2) Average the values
+weighted_means = accumarray(ic, weighted_means, [], @mean);
+
+switch st
+    case 1
+        % STRATEGY 1: Gradient Estimation
+
+        T = delaunayTriangulation(samples_tri);
+
+        grad_v = estimate_gradient(T,[samples_tri(:,1:ndim_spl) weighted_means]);  % samples_tri(:,end)
+        values = grad_v;
+
+        [samples_tri_prop, samples_tri_prop_val] = propose_samples_NEW4(samples_tri, ...
+            values,new_budget,discret_spl);
+
+        % strategy1{i,end+1} = [samples_tri(:,1:ndim_spl) vecnorm(grad_v,2,2)];
+        % strategy1_vals{i,end+1} = samples_pos_tri_prop;
+
+    case 2
+        [samples_pos_tri, weighted_means_pos] = ...
+            discretiseCoords(samples_tri, weighted_means, discret_spl, dim_spl);
+
+        % STRATEGY 2: Criticality
+        [criticality] = main_sampling_base(dim_spl,samples_pos_tri,weighted_means_pos);  % base for strategies 2 and 3
+        % TO USE THE WHOLE TENSOR
+        % [~,criticality] = main_sampling_base(dim,samples_pos_comp,samples_comp);
+        values = criticality;
+
+        samples_tri = idx2coord(samples_pos_tri, discret_spl, dim_spl);
+
+        [samples_tri_prop, samples_tri_prop_val] = propose_samples_NEW4(samples_tri, ...
+            values,new_budget,discret_spl);
+
+        % strategy2{i,end+1} = [samples_tri(:,1:ndim_spl) criticality];
+        % strategy2_vals{i,end+1} = samples_pos_tri_prop;
+
+    case 3
+        [samples_pos_tri, weighted_means_pos] = ...
+            discretiseCoords(samples_tri, weighted_means, discret_spl, dim_spl);
+        
+        % STRATEGY 3: Gradient of Criticality
+        [criticality] = main_sampling_base(dim_spl,samples_pos_tri,weighted_means_pos);  % base for strategies 2 and 3
+        
+        % (CHECKK)
+        % if all(criticality == criticality(1))
+        %     grad_cv = ones(numel(criticality), ndim_spl);
+        % else
+
+        samples_tri = idx2coord(samples_pos_tri, discret_spl, dim_spl);
+
+        T = delaunayTriangulation(samples_tri);
+
+        grad_cv = estimate_gradient(T, ...
+            [samples_tri(:,1:ndim_spl) weighted_means_pos],criticality);
+        values = grad_cv;
+
+        [samples_tri_prop, samples_tri_prop_val] = propose_samples_NEW4(samples_tri, ...
+            values,new_budget,discret_spl);
+
+        % strategy3{i,end+1} = [samples_tri(:,1:ndim_spl) vecnorm(grad_cv,2,2)];
+        % strategy3_vals{i,end+1} = samples_pos_tri_prop;
+end
+
+samples_pos_sts{st,i} = [samples_pos_sts{st,i}; samples_tri_prop];  %%%%%%%
+
+% Save information for next RUNS
+samples_pos_tri_run{i} = unique([samples_pos_tri_run{i}; samples_tri_prop],'rows','stable');  %%%%%%%
+
+samples_comp_eval = zeros(new_budget, length(spl)+length(dims_left)+1);
+
+for sam=1:size(samples_tri_prop,1)
+
+    sample = samples_tri_prop(sam,:);
+    [sample_comp, taken] = extend_samples_NEW2(dim,sample,splits, ...
+        taken,discret,i,store,st);
+
+    % Evaluate function
+    sample_comp_eval = [sample_comp, opt_function(sample_comp)];
+    samples_comp_eval(sam,:) = sample_comp_eval;
+
+    % Each time the function is evaluated, the samples are accumulated
+    % in the output variable
+    samples_OUTPUT = cat(1,samples_OUTPUT,sample_comp_eval);
+
+end
+
+% We store the samples proposed by the strategy
+samples_comp_sts{s,i} = cat(1,samples_comp_sts{s,i},samples_comp_eval);  %%%%%%%
+
+% ERROR of the samples
+errs = error_function(models_sts{s},samples_comp_eval);
+% And store them together with the positions
+samples_err = [samples_comp_eval(:,1:end-1), errs];
+
+
+% i) Most recent
+store{i}.samples{st} = samples_tri_prop_val;
+
+% ii) All
+% store{i}.samples{st} = [store{i}.samples{st}; samples_tri_prop_val];
+
+% iii) Mix
+% S = store{i}.samples{st};
+% N  = size(samples_tri_prop_val, 1);
+% k  = min(N, size(S,1));  % Cannot take more than available
+% 
+% [~, order] = sortrows(S, size(S,2), 'descend');
+% topRows    = S(order(1:k), :);
+% store{i}.samples{st} = [topRows; samples_tri_prop_val];
+
+
+samples_pos_err_subesp{i} = samples_err;
+
+samples_pos_err_wm{i,end+1} = samples_err;  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% ERROR
+
+% Total ERROR
+err = mean(samples_err(:,end-1));  % difference with estimates
+
+% Search minimum value
+% err = min(error_function(cat(1,samples_tri_orig{i},samples_tri_sts{s,i})));
+
+% Tensor estimation
+% err = error_function(cat(1,samples_comp_orig,samples_comp_sts{s,i}), ...
+%     samples_comp_test,samples_pos_test,dim);
+
+end
+
+function [sample_comp, taken] = extend_samples_NEW2(dim,sample,splits, ...
+    taken,discret,i,store,st)
+
+% Extend a point in one subspace) to the full D–dimensional space.
+%
+% Inputs:
+%   dim             full global dimensionality D
+%   sample          1×d_sub     coordinates in the current subspace
+%   splits          1×nSub cell, splits{s} = indices of subspace s
+%   taken           samples already taken
+%   discret         1×D   cell, discret{d}(1)=lb, end=ub
+%   i               subspace id
+%   store           1×nSub cell, each cell holds .samples{st}  (M×(d+1))
+%   st              strategy index
+%
+% Outputs:
+%   sample_comp     1×D   full-dimensional point (new and unique)
+%   taken           samples already taken (updated)
+
+
+subIdx = i;
+
+if length(dim) <= 3
+    % If there are no subspaces, the sample should not be extended
+    sample_comp = sample;
+else
+
+    row2key = @(p) sprintf('%.12g_', p);
+
+    % Precompute full dimension D
+    nSub = numel(splits);
+    % D = sum(cellfun(@numel, splits));
+    
+    lb  = cellfun(@(v) v(1),  discret)';   % 1×D
+    ub  = cellfun(@(v) v(end), discret)';  % 1×D
+    mid = (lb + ub)/2;
+
+    % Try until we find a NEW full-dimensional point
+    maxTrials = 100;
+    trial = 0;
+    
+    while true
+        trial = trial + 1;
+        if trial > maxTrials
+            error('extendSample:CouldNotFindUnique', ...
+                  'Failed to build a unique sample after %d trials.', ...
+                  maxTrials);
+        end
+    
+        xfull = mid;  % start with mids everywhere
+        xfull(splits{subIdx}) = sample;  % insert the known chunk
+    
+        % Fill every other subspace
+        for j = 1:nSub
+            if j == subIdx, continue; end
+    
+            Mj = store{j}.samples{st};  % Mj×(d_j+1) or []
+
+            if isempty(Mj)
+                % No information. Keep the mid-point already in xfull
+                continue
+            else
+                vals = abs(Mj(:,end));  % weights (use abs in case of neg.)
+                if all(vals==0), vals = ones(size(vals)); end
+
+                % vals = vals / sum(vals);
+    
+                idxRow = randsample(numel(vals),1,true,vals);  % weighted pick
+                chunk  = Mj(idxRow,1:end-1);  % 1×d_j
+                xfull(splits{j}) = chunk;  % insert chunk
+            end
+        end
+    
+        % Uniqueness check
+        key = row2key(xfull);
+        if ~isKey(taken,key)
+            sample_comp     = xfull;
+            return
+        end
+        % Otherwise retry with a different weighted pick
+    end
+    
+end
+
+end
+
+function samples_comp_orig = generate_initial_samples_NEW(splits, dim, ...
+    initial_budget, discret, opt_function)
+
+% Inputs :  splits – 1×nSub cell, splits{s} = column indices of subspace s
+%           dim
+%           initial_budget
+%           discret – 1×D bounds
+% 
+% Output:   samples_comp_orig – initial_budget × D matrix
+
+
+% Multiplier for Sobol candidate pool
+overshoot = 8;
+% Initial radius as a fraction of box diagonal
+minDist0  = 0.15;
+
+lb = cellfun(@(v) v(1) , discret)';  % first element of each grid
+ub = cellfun(@(v) v(end), discret)';
+
+D    = numel(dim);     % global dimensionality
+nSub = numel(splits);  % number of subspaces
+
+
+% Enumerate all subspace corners (each is a full-D point)
+
+mid = (lb + ub) / 2;  % filler for other coords (mid-value)
+
+cornerList = [];
+for s = 1:nSub
+    J = splits{s};                     % indices of subspace s
+    ds = numel(J);                     % 2 or 3
+    combos = dec2bin(0:2^ds-1) - '0';  % 0→lower 1→upper
+    for c = 1:size(combos,1)
+        p = mid;                         % start with mid-values
+        choose = combos(c,:)==0;
+        p(J(choose)) = lb(J(choose));    % set lower bounds
+        p(J(~choose)) = ub(J(~choose));  % set upper bounds
+        cornerList = [cornerList; p];    %#ok<AGROW>
+    end
+end
+cornerList       = unique(cornerList, 'rows');  % just in case of overlap
+Ncorner          = size(cornerList,1);
+
+if Ncorner > initial_budget
+    error('initial_budget (%d) smaller than #required corners (%d).', ...
+           initial_budget, Ncorner);
+end
+
+% Sobol candidate pool
+remain  = initial_budget - Ncorner;
+sob     = scramble(sobolset(D,'Skip',1000,'Leap',100), ...
+    'MatousekAffineOwen');
+Npool   = overshoot * remain;
+pool    = net(sob, Npool);
+pool    = bsxfun(@plus, lb, bsxfun(@times, pool, (ub-lb)));
+
+% Maximin radius
+boxDiag = norm(ub-lb);
+radius  = minDist0 * boxDiag;
+
+% Hash of already-taken points (string key)
+row2key = @(q) sprintf('%.12g_', q);
+taken   = containers.Map('KeyType','char','ValueType','logical');
+for k = 1:Ncorner
+    taken(row2key(cornerList(k,:))) = true;
+end
+
+accepted = cornerList;  % start with corners
+keep = Ncorner;
+idx = 1;
+
+% Adaptively decreasing radius
+while keep < initial_budget && idx <= Npool
+    x = pool(idx,:);   idx = idx+1;
+
+    % Distance test in every subspace
+    ok = true;
+    for s = 1:nSub
+        J    = splits{s};
+        if size(accepted,1)>0
+            [~,dist] = knnsearch(accepted(:,J), x(J), 'K',1);
+            if dist < radius
+                ok = false; break
+            end
+        end
+    end
+
+    if ok
+        keep = keep + 1;
+        accepted(keep,:) = x;
+        taken(row2key(x)) = true;
+    end
+
+    % If the pool is exhausted early, shrink radius and extend pool
+    if idx > Npool && keep < initial_budget
+        radius = radius * 0.7;
+        extra  = net(sob, overshoot*remain);
+        extra  = bsxfun(@plus, lb, bsxfun(@times, extra, (ub-lb)));
+        pool   = [pool; extra];  %#ok<AGROW>
+        Npool  = size(pool,1);
+    end
+end
+Xinit = accepted(1:keep,:);
+if keep < initial_budget
+    warning('Only %d/%d samples produced; increase ''overshoot''.', ...
+             keep, initial_budget);
+end
+
+
+% Evaluate function for all samples (vectorized)
+s = arrayfun(@(idx) opt_function(Xinit(idx, :)), 1:keep).';
+
+
+samples_comp_orig = [Xinit, s];
+
+end
+function [spl, ...
+          ndim_spl, ...
+          dim_spl, ...
+          steps_spl, ...
+          discret_spl, ...
+          dims_left] = ...
+                     get_split_information(splits, ...
+                                           ndims_run, ...
+                                           dims_run, ...
+                                           steps_run, ...
+                                           discrets_run, ...
+                                           dims_left_run, ...
+                                           i)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+spl = splits{i};
+ndim_spl = ndims_run{i};
+dim_spl = dims_run{i};
+steps_spl = steps_run{i};
+discret_spl = discrets_run{i};
+dims_left = dims_left_run{i};
+% n_corners = n_corners_run{i};
+
+end
+
+function samples_tri = ...
+         idx2coord(samples_pos_tri, discret_spl, dim_spl)
+
+% Convert the integer grid indices in samples_pos_tri back to their
+% coordinates. The row order is preserved, so the output can stay aligned
+% with weighted_means_pos (or any other row-wise data).
+%
+% Inputs:
+%   samples_pos_tri   M×D   integer indices
+%   discret_spl       1×D   cell; discret_spl{d}(1)=lb , end=ub
+%   dim_spl           1×D   number of grid nodes per dimension
+%
+% Output:
+%   samples_tri       M×D   coordinates in the original domain
+
+
+[M, D] = size(samples_pos_tri);
+assert(numel(discret_spl) ==D, 'discret_spl must have D cells');
+assert(numel(dim_spl) ==D, 'dim_spl length must be D');
+
+samples_tri = zeros(M, D);
+
+for d = 1:D
+    lo = discret_spl{d}(1);     % lower bound of dim d
+    hi = discret_spl{d}(end);   % upper bound
+    Mbin = dim_spl(d);          % number of grid points (1...Mbin)
+    step = (hi-lo) / (Mbin-1);  % uniform spacing
+
+    idx = samples_pos_tri(:,d);  % integer indices (1...Mbin)
+    samples_tri(:,d) = lo + (idx - 1) * step;  % map back to coordinate
+end
+
+end
+function varargout = initialize_function(name)
+
+nOutputs = nargout;
+varargout = cell(1,nOutputs);
+
+% rosen, rosen_2, rosen_10, rosen_6
+% ackley_6, rastrigin_6, levy_6, schwefel_6, powell_3
+
+
+%% TEST
+
+if name == "continuous_complex_2D" && nOutputs == 6
+    % Load Space
+    load Space_Slanted_Border_Function.mat Space X Y
+
+    % Dimensions of the space
+    dim = size(Space);
+    ndims = size(dim,2);
+
+    discret = cell(2,1);
+    discret{1} = X(1,:);
+    discret{2} = Y(:,1)';
+    
+    % Step sizes of the discrete space
+    stepsizeX = zeros(dim(1)-1,1);
+    for i=1:dim(1)-1
+        stepsizeX(i) = X(1,i+1)-X(1,i);
+    end
+    stepsizeX = mean(stepsizeX);
+    
+    stepsizeY = zeros(dim(2)-1,1);
+    for i=1:dim(2)-1
+        stepsizeY(i) = Y(i+1,1)-Y(i,1);
+    end
+    stepsizeY = mean(stepsizeY);
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    paramspace = cell(1,3);
+    paramspace{1} = Space;
+    paramspace{2} = X; paramspace{3} = Y;
+    
+    varargout{1} = paramspace;
+    % varargout{2} = Space;
+    % varargout{3} = X; varargout{4} = Y;
+    varargout{2} = discret;
+
+    % varargout{3} = [X(1,1),stepsizeX,X(1,end);
+    %                 Y(1,1),stepsizeY,Y(end,1)];
+    varargout{3} = [stepsizeX; stepsizeY];
+    
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    
+    % support = [X(1,:); Y(:,1)'];
+
+    % Plot function
+    figure
+    surf(X,Y,Space,'EdgeColor','none')
+
+
+elseif name == "epidemic_3D" && nOutputs == 6
+    % Load Space
+    load ParaSpaceG.mat ParaSpaceG
+    start = 0.025; step = 0.025; finish = 1;
+    [X,Y,Z] = ndgrid(start:step:finish);
+    
+    % Dimensions of the space
+    dim = size(ParaSpaceG);
+    ndims = size(dim,2);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    paramspace = cell(1,4);
+    paramspace{1} = ParaSpaceG;
+    paramspace{2} = X; paramspace{3} = Y; paramspace{4} = Z;
+
+    varargout{1} = paramspace;
+    % varargout{2} = ParaSpaceG;
+    % varargout{3} = X; varargout{4} = Y; varargout{5} = Z;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);  % repmat([start,step,finish],ndims,1)
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    
+    % support = [start:step:finish; start:step:finish; start:step:finish];
+
+
+elseif name == "rosenbrock_3D" && nOutputs == 6
+    start = -2; step = 0.1; finish = 2;
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    ndims = 3;
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+%% COMPETITORS
+
+elseif startsWith(name,'rosen_') && nOutputs == 6
+    start = -2.048; step = 0.0816; finish = 2.048;  %% 0.05
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    if ndims == 10
+        splits = cell(1,4);
+        splits{1} = [1 2 3];
+        splits{2} = [4 6];
+        splits{3} = [5 7];
+        splits{4} = [8 9 10];
+        % splits{5} = [11 12];
+    elseif ndims == 18
+        splits = cell(1,6);
+        splits{1} = [1 2 3];
+        splits{2} = [4 5 6];
+        splits{3} = [7 8 9];
+        splits{4} = [10 11 12];
+        splits{5} = [13 14 15];
+        splits{6} = [16 17 18];
+    end
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'normal_') && nOutputs == 6
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+    
+    if ndims == 2
+        start = -3; step = 1e-3; finish = 3;
+    else
+        start = -3; step = 1e-2; finish = 3;  % 0.075 | 0.25
+    end
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % if ndims == 6
+    %     splits = cell(1,3);
+    %     splits{1} = [1 2];
+    %     splits{2} = [3 4];
+    %     splits{3} = [5 6];
+    if ndims == 10
+        splits = cell(1,4);
+        splits{1} = [1 2 3];
+        splits{2} = [4 6];
+        splits{3} = [5 7];
+        splits{4} = [8 9 10];
+        % splits{5} = [11 12];
+    elseif ndims == 18
+        splits = cell(1,6);
+        splits{1} = [1 2 3];
+        splits{2} = [4 5 6];
+        splits{3} = [7 8 9];
+        splits{4} = [10 11 12];
+        splits{5} = [13 14 15];
+        splits{6} = [16 17 18];
+    end
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif (startsWith(name,'peak_') || ...
+        startsWith(name,'well_') || ...
+        startsWith(name,'crossVall_')) && nOutputs == 6
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+    
+    if ndims == 2
+        start = -2; step = 1e-3; finish = 2;
+    else
+        start = -2; step = 0.08; finish = 2;  % 0.075 | 1e-2 | 0.04
+    end
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+
+    % splits = cell(1,3);
+    % splits{1} = [1 2];
+    % splits{2} = [3 4];
+    % splits{3} = [5 6];
+
+    % if ndims == 6
+        % splits = cell(1,2);
+        % % splits{1} = [1 2 3]; splits{2} = [4 5 6];
+        % % splits{1} = [1 2 5]; splits{2} = [3 4 6];
+        % % splits{1} = [1 3 4]; splits{2} = [2 5 6];
+        % % splits{1} = [1 4 5]; splits{2} = [2 3 6];
+        % splits{1} = [1 5 6]; splits{2} = [2 3 4];
+    % end
+    
+    % if ndims == 10
+    %     splits = cell(1,4);
+    %     splits{1} = [1 2 3];
+    %     splits{2} = [4 6];
+    %     splits{3} = [5 7];
+    %     splits{4} = [8 9 10];
+    %     % splits{5} = [11 12];
+    % elseif ndims == 18
+    %     splits = cell(1,6);
+    %     splits{1} = [1 2 3];
+    %     splits{2} = [4 5 6];
+    %     splits{3} = [7 8 9];
+    %     splits{4} = [10 11 12];
+    %     splits{5} = [13 14 15];
+    %     splits{6} = [16 17 18];
+    % end
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'ackley_') && nOutputs == 6
+    start = -32.768; step = 0.65; finish = 32.768;  % 0.1
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % splits = cell(1,4);
+    % splits{1} = [1 2 3];
+    % splits{2} = [4 6];
+    % splits{3} = [5 7];
+    % splits{4} = [8 9 10];
+    % % splits{5} = [11 12];
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'griewank_') && nOutputs == 6
+    start = -600; step = 24; finish = 600;  % 6
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % if ndims == 6
+        % splits = cell(1,2);
+        % splits{1} = [1 2 3]; splits{2} = [4 5 6];
+        % % splits{1} = [1 2 5]; splits{2} = [3 4 6];
+        % % splits{1} = [1 3 4]; splits{2} = [2 5 6];
+        % % splits{1} = [1 4 5]; splits{2} = [2 3 6];
+        % % splits{1} = [1 5 6]; splits{2} = [2 3 4];
+    % end
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'langer_') && nOutputs == 6
+    start = 0; step = 0.2; finish = 10;
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+elseif startsWith(name,'rothyp_') && nOutputs == 6
+    start = -65.536; step = 2.6; finish = 65.536;  % 2
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'zakharov_') && nOutputs == 6
+    start = -5; step = 0.3; finish = 10;  % 0.15
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'michal_') && nOutputs == 6
+    start = 0; step = pi/50; finish = pi;
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+
+    % splits = cell(1,3);
+    % splits{1} = [1 2];
+    % splits{2} = [3 4];
+    % splits{3} = [5 6];
+
+    % if ndims == 6
+        % splits = cell(1,2);
+        % splits{1} = [1 2 3]; splits{2} = [4 5 6];
+        % % splits{1} = [1 2 5]; splits{2} = [3 4 6];
+        % % splits{1} = [1 3 4]; splits{2} = [2 5 6];
+        % % splits{1} = [1 4 5]; splits{2} = [2 3 6];
+        % % splits{1} = [1 5 6]; splits{2} = [2 3 4];
+    % end
+
+    % if ndims == 12
+    %     splits = cell(1,6);
+    %     splits{1} = [1 2];
+    %     splits{2} = [3 4];
+    %     splits{3} = [5 6];
+    %     splits{4} = [7 8];
+    %     splits{5} = [9 10];
+    %     splits{6} = [11 12];
+    % end
+
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'stybtang_') && nOutputs == 6
+    start = -5; step = 0.2; finish = 5;
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%
+%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%-%
+
+%% OTHERS
+
+elseif startsWith(name,'rastrigin_') && nOutputs == 6
+    start = -5; step = 0.25; finish = 5;
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % splits = cell(1,4);
+    % splits{1} = [1 2 3];
+    % splits{2} = [4 6];
+    % splits{3} = [5 7];
+    % splits{4} = [8 9 10];
+    % % splits{5} = [11 12];
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'levy_') && nOutputs == 6
+    start = -10; step = 0.5; finish = 10;
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % splits = cell(1,4);
+    % splits{1} = [1 2 3];
+    % splits{2} = [4 6];
+    % splits{3} = [5 7];
+    % splits{4} = [8 9 10];
+    % % splits{5} = [11 12];
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'schwefel_') && nOutputs == 6
+    start = -500; step = 10; finish = 500;
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % splits = cell(1,4);
+    % splits{1} = [1 2 3];
+    % splits{2} = [4 6];
+    % splits{3} = [5 7];
+    % splits{4} = [8 9 10];
+    % % splits{5} = [11 12];
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+elseif startsWith(name,'powell_') && nOutputs == 6
+    start = -4; step = 0.1; finish = 5;
+    % [X1,X2,X3,X4,X5,X6] = ndgrid(start:step:finish);
+
+    % Dimensions of the space
+    s = split(name,'_');
+    ndims = str2double(s{2});
+
+    dim = size(start:step:finish,2)+zeros(1,ndims);
+
+    ssf = repmat([start,step,finish],ndims,1);
+    discret = cell(ndims,1);
+    for i = 1:ndims
+        discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+    end
+    
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    % splits = create_subspaces(ndims,{[1 2 5],[7,13]});  % custom dims
+    
+    % splits = cell(1,4);
+    % splits{1} = [1 2 3];
+    % splits{2} = [4 6];
+    % splits{3} = [5 7];
+    % splits{4} = [8 9 10];
+    % % splits{5} = [11 12];
+    
+    % OUTPUT
+    % For now paramspace = [discret, ndims]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = ndims;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = repmat(step,ndims,1);
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+
+
+% elseif name == "sin_1D" && nOutputs == 6
+% 
+%     start = 0; step = 0.02; finish = 1.6;
+% 
+%     % Dimensions of the space
+%     ndims = 1;
+% 
+%     dim = size(start:step:finish,2)+zeros(1,ndims);
+% 
+%     ssf = repmat([start,step,finish],ndims,1);  % start step finish
+%     discret = cell(ndims,1);
+%     for i = 1:ndims
+%         discret{i} = ssf(i,1):ssf(i,2):ssf(i,3);
+%     end
+% 
+%     % SPLITS
+%     % We prioritize spaces of dimension 3. This could be changed
+%     splits = create_subspaces(ndims);
+% 
+%     % OUTPUT
+%     % For now paramspace = [discret, ndims]
+%     paramspace = cell(1,2);
+%     paramspace{1} = discret;
+%     paramspace{2} = ndims;
+% 
+%     varargout{1} = paramspace;
+%     varargout{2} = discret;
+%     varargout{3} = repmat(step,ndims,1);
+%     varargout{4} = dim; varargout{5} = ndims;
+%     varargout{6} = splits;
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%*************************************************************************%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% SURVEYS
+
+elseif name == "survey_2D" && nOutputs == 7
+
+    %% READ SURVEY DATA
+
+    % zipFileName = fullfile('2023-eleciones-autonomicas', ...
+    %                        '2023-05-06-filtered-Madrid-200.zip');
+    % zipFileContent = zip_getContent(zipFileName);
+    % char({zipFileContent.file_name}) % displays the file names
+    % 
+    % 
+    % 
+    % filename = fullfile('2023-eleciones-autonomicas', ...
+    %                     '2023-05-06-filtered-Madrid-200', ...
+    %                     '2023-05-06-Madrid-200.csv');
+    % 
+    % opts = detectImportOptions(filename);
+    % preview(filename,opts)
+    % 
+    % dbstop if error
+    % survey = readtable(filename);  % 'PreserveVariableNames',true
+    % 
+    % survey = readcell(filename);
+    
+    filename = 'survey-Madrid.csv';
+    % survey = readtable(filename);  % ERROR - ASK
+    survey_cell = readcell(filename);
+    survey = cell2table(survey_cell(2:end,:));
+    % Variable names
+    v_names = strings(1,size(survey_cell,2));
+    for v=1:size(survey_cell,2)
+        v_names(v) = survey_cell{1,v};
+    end
+    survey.Properties.VariableNames = v_names;
+
+    % survey-Valencia.csv -> survey (table)
+    % GENDER | YEAR
+    % PP | medico
+
+    % Dimensions of the space
+    ndims = 2;
+
+    discret = cell(ndims,1);
+
+    discret{1} = ["female" "male"];  % Gender
+    discret{2} = [1950 1960 1970 1980 1990 2000];  % Year
+
+    parties = ["PP.1" "MM.1" "PS.1" "Vox.1" "UP.1"];
+    other_voting = ["blanco.1" "no.vota.1" "no.decidido.1"];
+    control = [];  % "medico"
+
+    target_vars = cell(3,1);
+    target_vars{1} = parties;
+    target_vars{2} = other_voting;
+    target_vars{3} = control;
+    
+    dim = [];
+    for i=1:ndims
+        dim = cat(2,dim,length(discret{i}));
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    % For now paramspace = [discret, survey (table)]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = survey;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = ones(ndims,1);  % step = 1
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    varargout{7} = target_vars;
+
+
+elseif name == "survey_3D" && nOutputs == 7
+
+    % READ SURVEY DATA
+    
+    filename = 'survey-Valencia-3D.csv';
+    % survey = readtable(filename);  % ERROR - ASK
+    survey_cell = readcell(filename);
+    survey = cell2table(survey_cell(2:end,:));
+    % Variable names
+    v_names = strings(1,size(survey_cell,2));
+    for v=1:size(survey_cell,2)
+        v_names(v) = survey_cell{1,v};
+    end
+    survey.Properties.VariableNames = v_names;
+
+    % survey-Valencia-3D.csv -> survey (table)
+    % GENDER | INCOME | YEAR
+    % PP | PSOE | UP | medico
+
+    % Dimensions of the space
+    ndims = 3;
+
+    discret = cell(ndims,1);
+
+    discret{1} = ["female" "male"];  % Gender
+    discret{2} = ["lower" "middle" "high" "prefer_not_to_say"];  % Income
+    discret{3} = [1950 1960 1970 1980 1990 2000];  % Year
+
+    target_v = ["PP.2" "PS.2" "UP.2"];
+    control_v = "medico";
+
+    n_vars = size([target_v control_v],2);
+    
+    dim = [];
+    for i=1:ndims
+        dim = cat(2,dim,length(discret{i}));
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    % For now paramspace = [discret, survey (table)]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = survey;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = ones(ndims,1);  % step = 1
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    varargout{7} = n_vars;
+
+
+elseif name == "survey_3DEdu" && nOutputs == 7
+
+    % READ SURVEY DATA
+    
+    filename = 'survey-Valencia-3DEdu.csv';
+    % survey = readtable(filename);  % ERROR - ASK
+    survey_cell = readcell(filename);
+    survey = cell2table(survey_cell(2:end,:));
+    % Variable names
+    v_names = strings(1,size(survey_cell,2));
+    for v=1:size(survey_cell,2)
+        v_names(v) = survey_cell{1,v};
+    end
+    survey.Properties.VariableNames = v_names;
+
+    % survey-Valencia-3DEdu.csv -> survey (table)
+    % GENDER | EDUCATION | YEAR
+    % PP | PSOE | UP | medico
+
+    % Dimensions of the space
+    ndims = 3;
+
+    discret = cell(ndims,1);
+
+    discret{1} = ["female" "male"];  % Gender
+    discret{2} = ["elementary_school" "middle_school" "high_school" ...
+        "vocational_technical_college" "university" ...
+        "postgraduate"];  % Education
+    discret{3} = [1950 1960 1970 1980 1990 2000];  % Year
+
+    target_v = ["PP.2" "PS.2" "UP.2"];
+    control_v = "medico";
+
+    n_vars = size([target_v control_v],2);
+    
+    dim = [];
+    for i=1:ndims
+        dim = cat(2,dim,length(discret{i}));
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    splits = create_subspaces(ndims);
+    
+    % OUTPUT
+    % For now paramspace = [discret, survey (table)]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = survey;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = ones(ndims,1);  % step = 1
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    varargout{7} = n_vars;
+
+
+elseif name == "survey_5D" && nOutputs == 7
+
+    % READ SURVEY DATA
+    
+    filename = 'survey-Valencia-5D.csv';
+    % survey = readtable(filename);  % ERROR - ASK
+    survey_cell = readcell(filename);
+    survey = cell2table(survey_cell(2:end,:));
+    % Variable names
+    v_names = strings(1,size(survey_cell,2));
+    for v=1:size(survey_cell,2)
+        v_names(v) = survey_cell{1,v};
+    end
+    survey.Properties.VariableNames = v_names;
+
+    % survey-Valencia-5D.csv -> survey (table)
+    % GENDER | EDUCATION | INCOME | EMPLOYMENT | YEAR
+    % PP | PSOE | UP | medico
+
+    % Dimensions of the space
+    ndims = 5;
+
+    discret = cell(ndims,1);
+
+    discret{1} = ["female" "male"];  % Gender
+    discret{2} = ["elementary_school" "middle_school" "high_school" ...
+        "vocational_technical_college" "university" ...
+        "postgraduate"];  % Education
+    discret{3} = ["lower" "middle" "high" "prefer_not_to_say"];  % Income
+    discret{4} = ["employed_for_wages" "self_employed" "homemaker" ...
+        "unemployed_looking" "unemployed_not_looking" "student" ...
+        "retired" "unable_to_work" "other"];  % Employment
+    discret{5} = [1950 1960 1970 1980 1990 2000];  % Year
+
+    target_v = ["PP.2" "PS.2" "UP.2"];
+    control_v = "medico";
+
+    n_vars = size([target_v control_v],2);
+    
+    dim = [];
+    for i=1:ndims
+        dim = cat(2,dim,length(discret{i}));
+    end
+
+    % SPLITS
+    % We prioritize spaces of dimension 3. This could be changed
+    % splits = create_subspaces(ndims);
+
+    splits = cell(1,2);
+    splits{1} = [1 5];
+    splits{2} = [2 3 4];
+    
+    % OUTPUT
+    % For now paramspace = [discret, survey (table)]
+    paramspace = cell(1,2);
+    paramspace{1} = discret;
+    paramspace{2} = survey;
+
+    varargout{1} = paramspace;
+    varargout{2} = discret;
+    varargout{3} = ones(ndims,1);  % step = 1
+    varargout{4} = dim; varargout{5} = ndims;
+    varargout{6} = splits;
+    varargout{7} = n_vars;
+
+
+else
+    error(['Function non implemented or ' ...
+        'number of arguments do not match space size'])
+end
+
+end
+function [ndims_run, dims_run, steps_run, discrets_run, ...
+    ndims_left_run, dims_before_run, dims_after_run, dims_left_run] = ...
+    initialize_splits(splits, dim,steps, discret, ndims)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+num_splits = length(splits);
+dims_run = cell(num_splits,1);
+ndims_run = cell(num_splits,1);
+steps_run = cell(num_splits,1);
+discrets_run = cell(num_splits,1);
+
+ndims_left_run = cell(num_splits,1);
+dims_before_run = cell(num_splits,1);
+dims_after_run = cell(num_splits,1);
+dims_left_run = cell(num_splits,1);
+
+% corners_run = cell(num_splits,1);
+% n_corners_run = cell(num_splits,1);
+
+for i=1:length(splits)
+
+    spl = splits{i}; ndims_spl = length(spl);
+    dim_spl = dim(spl); steps_spl = steps(spl);
+    discret_spl = cell(ndims_spl,1);
+    for s=1:ndims_spl
+        discret_spl{s} = discret{spl(s)};
+    end
+    
+    ndims_left = ndims-ndims_spl;
+    
+    dims_before = [];
+    dims_after = [];
+    for ii=1:length(splits)
+        if ii<i
+            dims_before = cat(2,dims_before,splits{ii});
+        elseif ii>i
+            dims_after = cat(2,dims_after,splits{ii});
+        end
+    end
+    
+    dims_before = sort(dims_before);
+    dims_after = sort(dims_after);
+    dims_left = cat(2,dims_before,dims_after);
+
+    % % CORNERS
+    % % if ndims_spl==1
+    % %     corners = [1;dim_spl];
+    % % end
+    % if ndims_spl==2
+    % corners = [1 1;
+    %            1 dim_spl(2);
+    %            dim_spl(1) 1;
+    %            dim_spl(1) dim_spl(2)];
+    % 
+    % elseif ndims_spl==3
+    % corners = [1 1 1;
+    %            1 dim_spl(2) 1;
+    %            1 1 dim_spl(3);
+    %            1 dim_spl(2) dim_spl(3);
+    %            dim_spl(1) 1 1;
+    %            dim_spl(1) dim_spl(2) 1;
+    %            dim_spl(1) 1 dim_spl(3);
+    %            dim_spl(1) dim_spl(2) dim_spl(3)];
+    % end
+    % n_corners = size(corners,1);
+    
+    % Outputs
+    
+    ndims_run{i} = ndims_spl;
+    dims_run{i} = dim_spl;
+    steps_run{i} = steps_spl;
+    discrets_run{i} = discret_spl;
+    
+    ndims_left_run{i} = ndims_left;
+    dims_before_run{i} = dims_before;
+    dims_after_run{i} = dims_after;
+    dims_left_run{i} = dims_left;
+
+    % corners_run{i} = corners;
+    % n_corners_run{i} = n_corners;
+end
+
+end
+
+function [criticality] = main_sampling_base(dim,samples_pos,samples)  % fit,
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+if all(samples==samples(end))
+
+    % Same information to all points
+    criticality = ones(size(samples))./numel(samples);
+
+else
+    
+    % Tolerance (for HOSVD calculation)
+    eps = 0.0002;  % 0.0002
+    
+    % Create sparse tensor
+    sparseT = sptensor(samples_pos,samples(:,end),dim);
+    
+    tensor_orig = full(sparseT);  % Dense tensor
+    % T_doub = double(tensor_orig);
+    
+    % HOSVD estimation
+    % 0.25*siz
+    % 'ranks',[8, 8]
+    decom = hosvd(tensor_orig,2*sqrt(eps),'verbosity',0);  % 'verbosity',1
+    
+    % CALCULATE FIT
+    tensor_recon = full(decom);
+
+    % fit: in reality it is loss
+    % fit = norm(tensor_recon-tensor_orig)/norm(tensor_orig);
+    
+    n_samples = size(samples_pos,1);
+    losses = zeros(n_samples,1);
+    % Degree of fit
+    for i = 1:n_samples
+        losses(i) = abs(tensor_orig(samples_pos(i,:))-tensor_recon(samples_pos(i,:)));
+    end
+    
+    % Criticality
+    sum_losses = sum(losses,'all');
+    if sum_losses ~= 0
+        criticality = losses ./ sum_losses;
+    else
+        % Same probability for all of them
+        criticality = ones(n_samples,1) * (1/n_samples);
+    end
+    
+    % if all(losses == 0)
+    %     % If the tensor has been perfectly recomposed
+    %     % We give random values to 'criticality'
+    %     rand_v = rand(1,n_samples)';
+    %     % Normalize values to sum to 1
+    %     criticality = rand_v / sum(rand_v);
+    %     warning('Randomly generated run samples')
+    % else
+    %     criticality = losses./sum_losses;
+    % end
+
+end
+
+% PLOT CRITICALITIES
+% X, Y
+% % indexes = samples_pos;
+% % xx = zeros(1,n_samples);
+% % yy = zeros(1,n_samples);
+% % for i = 1:n_samples
+% %     xx(i) = X(indexes(i,1),indexes(i,2));
+% %     yy(i) = Y(indexes(i,1),indexes(i,2));
+% % end
+% 
+% % x = [0.1750 0.4210 0.8350 0.5080 0.6310 0.3400 0.6250 0.7390 0.1120 0.6760 0.8590 0.6730 0.3130 0.7060 0.1780 0.4420 0.7960 0.3250 0.3190 0.1990 0.1120 0.6190 0.2620 0.3010 0.4750 0.1390 0.5380 0.2110 0.5500 0.6370];
+% % y = [0.5180 0.7520 0.2000 0.4310 0.3110 0.2690 0.3410 0.4640 0.5030 0.6110 0.5210 0.7250 0.3560 0.8720 0.2210 0.7130 0.5180 0.6290 0.3050 0.3500 0.8120 0.9410 0.4400 0.7310 0.8720 0.8870 0.2630 0.2270 0.3290 0.8720];
+% % criticality = [0.0000 0.0006 0 0 0 0 0 0 0.0001 0 0 0 0 0.0797 0 0.0051 0.0000 0.0027 0 0.6491 0.0000 0.0001 0.2592 0.0000 0.0000 0.0000 0 0 0 0.0034];
+% 
+% % scatter3(x,y,criticality,[],criticality,'filled')  % '.r','markersize',10
+% % axis([0.1 1 0.2 1 0 1])
+% 
+% scatter3(samples(:,1),samples(:,2),criticality,'filled')
+% % colorbar
+% % colormap turbo
+
+end
+
+function [nsub3, nsub2] = number_subsp(n)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+% We prioritize spaces of dimension 3. This could be changed
+
+if mod(n,3)==0
+    nsub3 = n/3;
+    nsub2 = 0;
+elseif mod(n,3)==1
+    nsub3 = (n-4)/3;
+    nsub2 = 2;
+elseif mod(n,3)==2
+    nsub3 = (n-2)/3;
+    nsub2 = 1;
+end
+
+end
+
+function [Xnew, Xnew_val] = propose_samples_NEW4(samples_tri, ...
+    values,new_budget,discret_spl)
+
+% Proposal for 2-D / 3-D subspaces
+% Inputs:
+%   samples_tri  (N×d) : existing coordinates (d = 2 or 3)
+%   values       (N×1) : associated values  (higher -> more interesting)
+%   new_budget         : how many new points to return
+%   discret_spl        : discretized values of the subspace dimensions
+%
+% Outputs:
+%   Xnew      q×(d+1) : newly proposed coordinates
+%   Xnew_val
+
+
+% Mixing coefficient 0<T≤1 (Temperature)
+Tmix = 1;
+% Kernel width as fraction of box diagonal
+sigmaFac = 0.02;
+
+% Proportion of box to drop
+edgeCut = 0.025;  % Default: outer 2.5% per dimension
+
+[N,d] = size(samples_tri);
+assert(d==2 || d==3, 'Sampler designed for 2- or 3-D spaces.');
+
+% Lower and upper bounds as 1×d row-vectors
+lb = cellfun(@(v) v(1) , discret_spl)';   % first element of each grid
+ub = cellfun(@(v) v(end), discret_spl)';  % last  element of each grid
+
+
+if size(values,2)>=2
+    % GRADIENT norm
+    values = vecnorm(values, 2, 2);  % vectorized norm computation
+end
+
+
+%% 1. Normalize coordinates to [0,1] box
+Xn = (samples_tri - lb) ./ (ub - lb);
+boxDiag = sqrt(d);  % diag length of [0,1]^d
+sigma = sigmaFac * boxDiag;  % isotropic Gaussian width
+
+
+%% 2. Rescale 'values' to positive weights, then compress with k-means
+w  = values - min(values);  % shift to non-negative
+if all(w==0), w = ones(size(w)); end
+w  = w / sum(w);  % normalize
+
+% Filter out edge points
+maskCore = all( Xn > edgeCut & Xn < (1-edgeCut), 2 );  % N×1 logical
+
+% If the filter removes every point, return to all points
+if ~any(maskCore)
+    maskCore = true(size(Xn,1),1);
+end
+
+Xcore = Xn(maskCore,:);      % coordinates without border points
+wcore = w(maskCore);         % matching weights
+wcore = wcore / sum(wcore);  % renormalize to sum=1
+
+% Weighted subsampling to get M centres
+nCenters = chooseNumCentres(wcore, new_budget);
+
+M = min(nCenters, N);  % cannot exceed N
+idxC = randsample(size(Xcore,1), M, true, wcore);  % with replacement
+centres = Xcore(idxC,:);  % M×d (in unit cube)
+wC = wcore(idxC);  % weights
+wC = wC / sum(wC);  % renormalize
+
+
+%% 3. Draw 'new_budget' points from the mixture (Tmix⋅KDE + (1-Tmix)⋅Uniform)
+U  = rand(new_budget,1);
+
+Xnew = zeros(new_budget,d);
+for i = 1:new_budget
+    if U(i) < Tmix
+        % Draw from KDE component
+        k     = randsample(numel(wC),1,true,wC);
+        mu    = centres(k,:);
+        Xcand = mu + sigma*randn(1,d);
+        Xcand = max(min(Xcand,1),0);  % keep inside [0,1]
+    else
+        % Draw uniform exploration sample
+        Xcand = rand(1,d);
+    end
+    Xnew(i,:) = lb + Xcand.*(ub-lb);
+end
+
+
+%% 4. Interpolate values
+switch d
+    case 2
+        F = scatteredInterpolant(samples_tri(:,1), ...
+                                 samples_tri(:,2), ...
+                                 values, 'natural', 'nearest');
+        
+        vhat = F(Xnew(:,1), Xnew(:,2));
+    
+    case 3
+        F = scatteredInterpolant(samples_tri(:,1), ...
+                                 samples_tri(:,2), ...
+                                 samples_tri(:,3), ...
+                                 values, 'natural', 'nearest');
+
+        vhat = F(Xnew(:,1), Xnew(:,2), Xnew(:,3));
+
+    otherwise
+        error('Sampler designed for 2-D or 3-D subspaces.');
+end
+
+Xnew_val = [Xnew, vhat(:)];
+
+
+end
+function omega=Solid_Angle_Triangle(p,va,vb,vc)
+
+% Compute relative vectors and precompute norms
+r_pa=p-va; norm_r_pa=norm(r_pa);
+r_pb=p-vb; norm_r_pb=norm(r_pb);
+r_pc=p-vc; norm_r_pc=norm(r_pc);
+
+% Compute cross product and dot products
+cross_r_pb_r_pc = cross(r_pb, r_pc);
+dot_r_pa_r_pb = dot(r_pa, r_pb);
+dot_r_pa_r_pc = dot(r_pa, r_pc);
+dot_r_pb_r_pc = dot(r_pb, r_pc);
+
+numerator = dot(r_pa,cross_r_pb_r_pc);
+denominator = norm_r_pa * norm_r_pb * norm_r_pc + ...
+              dot_r_pa_r_pb * norm_r_pc + ...
+              dot_r_pa_r_pc * norm_r_pb + ...
+              dot_r_pb_r_pc * norm_r_pa;
+
+omega = 2 * atan2(numerator,denominator);
+
+endfunction models_sts = update_models(n_strategies,models_sts, ...
+    samples_comp_orig,samples_comp_extra,samples_comp_sts)
+%UNTITLED Summary of this function goes here
+%   Detailed explanation goes here
+
+parfor s=1:n_strategies
+    
+    samples_comp_model = cat(1,samples_comp_orig,samples_comp_extra, ...
+        vertcat(samples_comp_sts{s,:}));
+    
+    % Create new model
+    X = samples_comp_model(:,1:end-1);
+    y = samples_comp_model(:,end);
+
+    % % Test with other kernels if necessary:
+    % % 'exponential', 'matern32' or 'matern52'
+    % gprMdl = fitrgp(X,y,'KernelFunction', 'matern32', ...
+    %     'FitMethod','fic','ActiveSetSize',25);  % 'PredictMethod','fic'
+    % % cgprMdl = compact(gprMdl);
+    
+    Mdl = fitrensemble(X,y,'NumLearningCycles',50);
+    models_sts{s} = Mdl;
+    
+end
+
+end
+
